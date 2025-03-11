@@ -572,7 +572,7 @@ The activation format is token<tab>activation, and activations range from 0 to 1
             token_index_to_score,
             end_of_prompt=True,
         )
-        return prompt_builder.build(self.prompt_format, allow_extra_system_messages=True)
+        return prompt_builder.build(self.prompt_format)
 
 
 def _format_record_for_logprob_free_simulation(
@@ -750,7 +750,7 @@ class LogprobFreeExplanationTokenSimulator(NeuronSimulator):
     ) -> Union[str, list[HarmonyMessage]]:
         """Make a few-shot prompt for predicting the neuron's activations on a sequence."""
         assert explanation != ""
-        prompt_builder = PromptBuilder(allow_extra_system_messages=True)
+        prompt_builder = PromptBuilder()
         prompt_builder.add_message(
             Role.SYSTEM,
             """We're studying neurons in a neural network. Each neuron looks for some particular thing in a short document. Look at  an explanation of what the neuron does, and try to predict its activations on a particular token.

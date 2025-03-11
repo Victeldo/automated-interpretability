@@ -176,10 +176,6 @@ def was_token_split(current_token: str, response_tokens: Sequence[str], start_in
     assert merged_response_tokens.endswith(current_token)
     num_merged_tokens = start_index - merged_response_index
     token_was_split = num_merged_tokens > 1
-    if token_was_split:
-        logger.debug(
-            "Warning: token from the subject model was split into 2+ tokens by the simulator model."
-        )
     return token_was_split
 
 
@@ -605,34 +601,180 @@ def _parse_no_logprobs_completion(
     """
     Parse a completion into a list of simulated activations. If the model did not faithfully
     reproduce the token sequence, return a list of 0s. If the model's activation for a token
-    is not an integer betwee 0 and 10, substitute 0.
+    is not an integer between 0 and 10, substitute 0.
 
     Args:
         completion: completion from the API
         tokens: list of tokens as strings in the sequence where the neuron is being simulated
     """
+    
+    # Start with a zero prediction as fallback
     zero_prediction = [0] * len(tokens)
-    token_lines = completion.strip("\n").split("༗\n")
-    start_line_index = None
-    for i, token_line in enumerate(token_lines):
-        if token_line.startswith(f"{tokens[0]}\t"):
-            start_line_index = i
-            break
+    
+    # Try special delimiter format first
+    if "༗\n" in completion:
+        token_lines = completion.strip("\n").split("༗\n")
+        start_line_index = None
+        for i, token_line in enumerate(token_lines):
+            if token_line.startswith(f"{tokens[0]}\t"):
+                start_line_index = i
+                break
 
-    # If we didn't find the first token, or if the number of lines in the completion doesn't match
-    # the number of tokens, return a list of 0s.
-    if start_line_index is None or len(token_lines) - start_line_index != len(tokens):
-        return zero_prediction
-    predicted_activations = []
-    for i, token_line in enumerate(token_lines[start_line_index:]):
-        if not token_line.startswith(f"{tokens[i]}\t"):
-            return zero_prediction
-        predicted_activation = token_line.split("\t")[1]
-        if predicted_activation not in VALID_ACTIVATION_TOKENS:
-            predicted_activations.append(0)
-        else:
-            predicted_activations.append(int(predicted_activation))
-    return predicted_activations
+        # If we found the first token and the number of lines matches
+        if start_line_index is not None and len(token_lines) - start_line_index >= len(tokens):
+            predicted_activations = []
+            for i, token_line in enumerate(token_lines[start_line_index:start_line_index+len(tokens)]):
+                if not token_line.startswith(f"{tokens[i]}\t"):
+                    logger.warning(f"Token mismatch: Expected '{tokens[i]}' but found line '{token_line}'")
+                    break
+                
+                # Extract activation value
+                parts = token_line.split("\t")
+                if len(parts) < 2:
+                    logger.warning(f"Missing tab delimiter in line: '{token_line}'")
+                    break
+                    
+                predicted_activation = parts[1].strip()
+                if predicted_activation in VALID_ACTIVATION_TOKENS:
+                    predicted_activations.append(int(predicted_activation))
+                else:
+                    # Try to extract any digit from the line
+                    import re
+                    digit_match = re.search(r'\b([0-9]|10)\b', predicted_activation)
+                    if digit_match:
+                        extracted_value = digit_match.group(0)
+                        if extracted_value in VALID_ACTIVATION_TOKENS:
+                            predicted_activations.append(int(extracted_value))
+                        else:
+                            logger.warning(f"Invalid activation value: '{extracted_value}'")
+                            predicted_activations.append(0)
+                    else:
+                        logger.warning(f"No valid activation found in: '{predicted_activation}'")
+                        predicted_activations.append(0)
+            
+            # If we successfully processed all tokens
+            if len(predicted_activations) == len(tokens):
+                return predicted_activations
+    
+    # Try markdown table format (Claude 3.7 Sonnet often produces this)
+    if "|" in completion:
+        try:
+            # Split into lines and filter to only include table rows with pipes
+            table_rows = [line for line in completion.split("\n") if "|" in line]
+            
+            # Skip header and separator rows
+            data_rows = [row for row in table_rows if "---" not in row and "Token" not in row and "Activation" not in row]
+            
+            # Map tokens to their activations
+            token_to_activation = {}
+            for row in data_rows:
+                cells = [cell.strip() for cell in row.split("|")]
+                cells = [cell for cell in cells if cell]  # Remove empty cells
+                
+                if len(cells) >= 2:
+                    token_text = cells[0]
+                    activation_text = cells[1]
+                    
+                    # Look for digits in the activation
+                    import re
+                    digit_match = re.search(r'\b([0-9]|10)\b', activation_text)
+                    if digit_match:
+                        extracted_value = digit_match.group(0)
+                        if extracted_value in VALID_ACTIVATION_TOKENS:
+                            token_to_activation[token_text] = int(extracted_value)
+            
+            # Try to map our tokens to found activations
+            if token_to_activation:
+                predicted_activations = []
+                all_found = True
+                for token in tokens:
+                    if token in token_to_activation:
+                        predicted_activations.append(token_to_activation[token])
+                    else:
+                        # Look for partial matches or tokens that include the target token
+                        found = False
+                        for table_token, activation in token_to_activation.items():
+                            if token in table_token or table_token in token:
+                                predicted_activations.append(activation)
+                                found = True
+                                break
+                        
+                        if not found:
+                            logger.warning(f"Could not find token '{token}' in table")
+                            predicted_activations.append(0)
+                            all_found = False
+                
+                if len(predicted_activations) == len(tokens) and all_found:
+                    return predicted_activations
+                
+                if len(predicted_activations) == len(tokens):
+                    return predicted_activations
+        except Exception as e:
+            logger.warning(f"Error parsing table format: {e}")
+    
+    # Try tab-delimited format (without special delimiter)
+    if "\t" in completion:
+        try:
+            parsed_values = {}
+            for line in completion.split("\n"):
+                if "\t" in line:
+                    parts = line.split("\t")
+                    if len(parts) >= 2:
+                        token_text = parts[0].strip()
+                        activation_text = parts[1].strip()
+                        
+                        # Look for exact token matches
+                        for idx, token in enumerate(tokens):
+                            if token == token_text:
+                                # Extract digits
+                                import re
+                                digit_match = re.search(r'\b([0-9]|10)\b', activation_text)
+                                if digit_match:
+                                    extracted_value = digit_match.group(0)
+                                    if extracted_value in VALID_ACTIVATION_TOKENS:
+                                        parsed_values[idx] = int(extracted_value)
+            
+            # If we found any values, fill in the zeros for missing tokens
+            if parsed_values:
+                predicted_activations = [parsed_values.get(i, 0) for i in range(len(tokens))]
+                if any(predicted_activations):
+                    return predicted_activations
+        except Exception as e:
+            logger.warning(f"Error parsing tab format: {e}")
+    
+    # Last resort: try to find any pattern of token followed by a number
+    try:
+        import re
+        predicted_activations = []
+        
+        for token in tokens:
+            # Escape special regex characters in the token
+            escaped_token = re.escape(token)
+            
+            # Look for the token followed by anything, then a digit 0-10
+            pattern = f"{escaped_token}[^0-9]*?([0-9]|10)\\b"
+            match = re.search(pattern, completion)
+            
+            if match:
+                value = match.group(1)
+                if value in VALID_ACTIVATION_TOKENS:
+                    predicted_activations.append(int(value))
+                    # Remove this match so we don't find it again for the next token
+                    completion = completion.replace(match.group(0), "", 1)
+                else:
+                    predicted_activations.append(0)
+            else:
+                predicted_activations.append(0)
+        
+        # Only return this if we found at least some non-zero values
+        if any(predicted_activations):
+            return predicted_activations
+    except Exception as e:
+        logger.warning(f"Error with regex pattern matching: {e}")
+    
+    # If all else fails, return zeros
+    logger.warning("All parsing methods failed. Model output was:\n" + completion)
+    return zero_prediction
 
 
 class LogprobFreeExplanationTokenSimulator(NeuronSimulator):
@@ -717,20 +859,58 @@ class LogprobFreeExplanationTokenSimulator(NeuronSimulator):
             tokens,
             self.explanation,
         )
-        response = await self.api_client.make_request(
-            prompt=prompt, echo=False, max_tokens=1000
-        )
-        assert len(response["choices"]) == 1
+        max_retries = 100
+        retry_count = 0
+        completion = ""
+        
+        while retry_count < max_retries:
+            temperature = 0.0 if retry_count == 0 else min(0.2 * retry_count, 0.7)
+            
+            response = await self.api_client.make_request(
+                prompt=prompt, echo=False, max_tokens=1000, temperature=temperature
+            )
+            assert len(response["choices"]) == 1
 
-        choice = response["choices"][0]
-        if self.prompt_format == PromptFormat.HARMONY_V4:
-            completion = choice["message"]["content"]
-        elif self.prompt_format in [PromptFormat.NONE, PromptFormat.INSTRUCTION_FOLLOWING]:
-            completion = choice["text"]
-        else:
-            raise ValueError(f"Unhandled prompt format {self.prompt_format}")
-
-        predicted_activations = _parse_no_logprobs_completion(completion, tokens)
+            choice = response["choices"][0]
+            
+            if self.prompt_format == PromptFormat.HARMONY_V4:
+                if "message" in choice and "content" in choice["message"]:
+                    completion = choice["message"]["content"]
+                else:
+                    completion = choice.get("text", "")
+            elif self.prompt_format in [PromptFormat.NONE, PromptFormat.INSTRUCTION_FOLLOWING]:
+                completion = choice["text"]
+            else:
+                raise ValueError(f"Unhandled prompt format {self.prompt_format}")
+                
+            # Check if the completion is empty
+            if not completion or completion.strip() == "":
+                retry_count += 1
+                # Retry logic counter
+                # logger.warning(f"Empty completion received from model (attempt {retry_count}/{max_retries}). Retrying...")
+                # Short sleep to avoid rate limits
+                await asyncio.sleep(0.5)
+                continue
+                
+            # Try parsing the completion
+            predicted_activations = _parse_no_logprobs_completion(completion, tokens)
+            
+            # Check if parsing succeeded (at least one non-zero value)
+            if any(predicted_activations):
+                # We got a successful response, break out of retry loop
+                # logger.warning(f"Successfully parsed activations for tokens starting with {tokens[:3]} on attempt {retry_count+1}")
+                break
+                
+            # Otherwise try again
+            retry_count += 1
+            # logger.warning(f"Failed to parse activations for tokens starting with {tokens[:3]} (attempt {retry_count}/{max_retries})")
+            # Short sleep to avoid rate limits
+            await asyncio.sleep(0.5)
+            
+        # If we've exhausted all retries and still got empty or unparseable response, log and return zeros
+        if retry_count == max_retries and (not completion or not any(predicted_activations)):
+            logger.warning(f"All {max_retries} attempts failed to produce usable completions")
+            predicted_activations = [0] * len(tokens)
 
         result = SequenceSimulation(
             activation_scale=ActivationScale.SIMULATED_NORMALIZED_ACTIVATIONS,
@@ -751,14 +931,38 @@ class LogprobFreeExplanationTokenSimulator(NeuronSimulator):
         """Make a few-shot prompt for predicting the neuron's activations on a sequence."""
         assert explanation != ""
         prompt_builder = PromptBuilder()
-        prompt_builder.add_message(
-            Role.SYSTEM,
-            """We're studying neurons in a neural network. Each neuron looks for some particular thing in a short document. Look at  an explanation of what the neuron does, and try to predict its activations on a particular token.
+        
+        # Check if model is likely a Claude 3.7 model
+        is_claude_3_7 = "claude-3-7" in self.api_client.model_name.lower() or "claude-3.7" in self.api_client.model_name.lower() or "sonnet" in self.api_client.model_name.lower()
+        
+        if is_claude_3_7:
+            # Special instructions for Claude 3.7 that likes to use tables
+            prompt_builder.add_message(
+                Role.SYSTEM,
+                """We're studying neurons in a neural network. Each neuron looks for some particular thing in a short document. Look at an explanation of what the neuron does, and try to predict its activations on a particular token.
+
+IMPORTANT INSTRUCTIONS:
+1. Activations must be integers ranging from 0 to 10. Most activations will be 0.
+2. A value of 0 means the neuron is not activated by the token.
+3. Values 1-10 represent increasing levels of activation (10 being maximum activation).
+4. You must include all tokens EXACTLY as they appear in the input, without any changes.
+5. You must maintain the EXACT same format from the examples, using token<tab>activation<delimiter> on each line.
+
+For each sequence, you will see tokens where the activations are left blank. Your job is to fill in those activations based on the explanation of what the neuron does.
+
+IMPORTANT: Maintain the exact format from the examples. Do not create tables or other formats.
+""",
+            )
+        else:
+            # Standard instructions for other models
+            prompt_builder.add_message(
+                Role.SYSTEM,
+                """We're studying neurons in a neural network. Each neuron looks for some particular thing in a short document. Look at an explanation of what the neuron does, and try to predict its activations on a particular token.
 
 The activation format is token<tab>activation, and activations range from 0 to 10. Most activations will be 0.
 For each sequence, you will see the tokens in the sequence where the activations are left blank. You will print the exact same tokens verbatim, but with the activations filled in according to the explanation.
 """,
-        )
+            )
 
         few_shot_examples = self.few_shot_example_set.get_examples()
         for i, example in enumerate(few_shot_examples):

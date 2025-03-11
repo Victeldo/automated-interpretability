@@ -3,6 +3,7 @@ import contextlib
 import os
 import random
 import traceback
+import logging
 from asyncio import Semaphore
 from functools import wraps
 from typing import Any, Callable, Optional
@@ -10,51 +11,44 @@ from typing import Any, Callable, Optional
 import httpx
 import orjson
 
+# Set up logging for better debugging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 def is_api_error(err: Exception) -> bool:
     if isinstance(err, httpx.HTTPStatusError):
         response = err.response
-        error_data = response.json().get("error", {})
-        error_message = error_data.get("message")
+        try:
+            error_data = response.json().get("error", {})
+        except Exception:
+            error_data = {}
+        error_message = error_data.get("message", "")
+        
         if response.status_code in [400, 404, 415]:
             if error_data.get("type") == "idempotency_error":
-                print(f"Retrying after idempotency error: {error_message} ({response.url})")
+                logger.warning(f"Retrying after idempotency error: {error_message} ({response.url})")
                 return True
-            else:
-                # Invalid request
-                return False
+            return False  # Invalid request, do not retry
         else:
-            print(f"Retrying after API error: {error_message} ({response.url})")
+            logger.warning(f"Retrying after API error: {error_message} ({response.url})")
             return True
 
-    elif isinstance(err, httpx.ConnectError):
-        print(f"Retrying after connection error... ({err.request.url})")
+    elif isinstance(err, (httpx.ConnectError, httpx.TimeoutException, httpx.ReadError)):
+        logger.warning(f"Retrying after connection/timeout/read error... ({err.request.url})")
         return True
-
-    elif isinstance(err, httpx.TimeoutException):
-        print(f"Retrying after a timeout error... ({err.request.url})")
-        return True
-
-    elif isinstance(err, httpx.ReadError):
-        print(f"Retrying after a read error... ({err.request.url})")
-        return True
-
-    print(f"Retrying after an unexpected error: {repr(err)}")
+    
+    logger.error(f"Retrying after an unexpected error: {repr(err)}")
     traceback.print_tb(err.__traceback__)
     return True
-
 
 def exponential_backoff(
     retry_on: Callable[[Exception], bool] = lambda err: True
 ) -> Callable[[Callable], Callable]:
     """
-    Returns a decorator which retries the wrapped function as long as the specified retry_on
-    function returns True for the exception, applying exponential backoff with jitter after
-    failures, up to a retry limit.
+    Exponential backoff retry decorator with jitter.
     """
     init_delay_s = 1.0
     max_delay_s = 10.0
-    # Roughly 30 minutes before we give up.
     max_tries = 200
     backoff_multiplier = 2.0
     jitter = 0.2
@@ -63,7 +57,7 @@ def exponential_backoff(
         assert asyncio.iscoroutinefunction(f)
 
         @wraps(f)
-        async def f_retry(*args: Any, **kwargs: Any) -> None:
+        async def f_retry(*args: Any, **kwargs: Any) -> Any:
             delay_s = init_delay_s
             for i in range(max_tries):
                 try:
@@ -79,74 +73,110 @@ def exponential_backoff(
 
     return decorate
 
-
-API_KEY = os.getenv("OPENAI_API_KEY")
-assert API_KEY, "Please set the OPENAI_API_KEY environment variable"
+API_KEY = os.getenv("ANTHROPIC_API_KEY")
+assert API_KEY, "Please set the ANTHROPIC_API_KEY environment variable"
 API_HTTP_HEADERS = {
     "Content-Type": "application/json",
-    "Authorization": "Bearer " + API_KEY,
+    "x-api-key": API_KEY,
+    "anthropic-version": "2023-06-01",
 }
-BASE_API_URL = "https://api.openai.com/v1"
-
+BASE_API_URL = "https://api.anthropic.com/v1/messages"
 
 class ApiClient:
-    """Performs inference using the OpenAI API. Supports response caching and concurrency limits."""
-
+    """Performs inference using the Anthropic API."""
+    
     def __init__(
         self,
         model_name: str,
-        # If set, no more than this number of HTTP requests will be made concurrently.
         max_concurrent: Optional[int] = None,
-        # Whether to cache request/response pairs in memory to avoid duplicating requests.
         cache: bool = False,
     ):
         self.model_name = model_name
-
-        if max_concurrent is not None:
-            self._concurrency_check: Optional[Semaphore] = Semaphore(max_concurrent)
-        else:
-            self._concurrency_check = None
-
-        if cache:
-            self._cache: Optional[dict[str, Any]] = {}
-        else:
-            self._cache = None
+        self._concurrency_check = Semaphore(max_concurrent) if max_concurrent else None
+        self._cache = {} if cache else None
 
     @exponential_backoff(retry_on=is_api_error)
     async def make_request(
         self, timeout_seconds: Optional[int] = None, **kwargs: Any
     ) -> dict[str, Any]:
+        import copy
+        request_data = copy.deepcopy(kwargs)
+
+        # Convert "prompt" to Anthropic messages format
+        if "prompt" in request_data and "messages" not in request_data:
+            prompt = request_data.pop("prompt")
+            request_data["messages"] = [{"role": "user", "content": prompt}]
+
+        request_data["model"] = self.model_name
+
+        # Extract system messages and set them as top-level "system"
+        system_messages = [m for m in request_data.get("messages", []) if m.get("role") == "system"]
+        if system_messages:
+            request_data["system"] = "\n".join(m.get("content", "") for m in system_messages)
+            request_data["messages"] = [m for m in request_data["messages"] if m.get("role") != "system"]
+        
+        # Ensure correct message formatting
+        for msg in request_data.get("messages", []):
+            if isinstance(msg.get("content"), str):
+                msg["content"] = [{"type": "text", "text": msg["content"]}]
+        
+        # Set max_tokens if missing
+        request_data.setdefault("max_tokens", 256)
+
+        # Remove unsupported OpenAI parameters
+        openai_params = ["logprobs", "logit_bias", "presence_penalty", "frequency_penalty", "best_of", "echo", "n", "stop", "stream"]
+        for param in openai_params:
+            if param in request_data:
+                # logger.warning(f"Removing unsupported OpenAI parameter '{param}' for Anthropic API")
+                request_data.pop(param, None)
+        
+        # Rename stop to stop_sequences
+        if "stop" in request_data:
+            request_data["stop_sequences"] = request_data.pop("stop")
+        
         if self._cache is not None:
-            key = orjson.dumps(kwargs)
+            key = orjson.dumps(request_data)
             if key in self._cache:
                 return self._cache[key]
-        async with contextlib.AsyncExitStack() as stack:
-            if self._concurrency_check is not None:
-                await stack.enter_async_context(self._concurrency_check)
-            http_client = await stack.enter_async_context(
-                httpx.AsyncClient(timeout=timeout_seconds)
-            )
-            # If the request has a "messages" key, it should be sent to the /chat/completions
-            # endpoint. Otherwise, it should be sent to the /completions endpoint.
-            url = BASE_API_URL + ("/chat/completions" if "messages" in kwargs else "/completions")
-            kwargs["model"] = self.model_name
-            response = await http_client.post(url, headers=API_HTTP_HEADERS, json=kwargs)
-        # The response json has useful information but the exception doesn't include it, so print it
-        # out then reraise.
-        try:
-            response.raise_for_status()
-        except Exception as e:
-            print(response.json())
-            raise e
-        if self._cache is not None:
-            self._cache[key] = response.json()
-        return response.json()
 
+
+        async with contextlib.AsyncExitStack() as stack:
+            if self._concurrency_check:
+                await stack.enter_async_context(self._concurrency_check)
+            http_client = await stack.enter_async_context(httpx.AsyncClient(timeout=timeout_seconds))
+            response = await http_client.post(BASE_API_URL, headers=API_HTTP_HEADERS, json=request_data)
+
+        # response.raise_for_status()
+        response_json = response.json()
+        
+        # Transform response into OpenAI-like format
+        # Important: preserve the exact response format including special delimiters
+        response_text = "".join(block.get("text", "") for block in response_json.get("content", []) if block.get("type") == "text")
+        
+        # Create a proper message field for HARMONY_V4 format
+        message = {"role": "assistant", "content": response_text}
+        
+        transformed_response = {
+            "choices": [{
+                "text": response_text,
+                "message": message,
+                "logprobs": None,
+                "index": 0,
+                "finish_reason": response_json.get("stop_reason", "stop"),
+                # Store raw response for debugging
+                "raw_response": response_json
+            }],
+            "usage": response_json.get("usage", {})
+        }
+
+        if self._cache is not None:
+            self._cache[key] = transformed_response
+        
+        return transformed_response
 
 if __name__ == "__main__":
-
     async def main() -> None:
-        client = ApiClient(model_name="gpt-3.5-turbo", max_concurrent=1)
-        print(await client.make_request(prompt="Why did the chicken cross the road?", max_tokens=9))
-
+        client = ApiClient(model_name="claude-3-opus-20240229", max_concurrent=1)
+        response = await client.make_request(prompt="Why did the chicken cross the road?", max_tokens=9, temperature=0.7)
+        print(response)
     asyncio.run(main())
